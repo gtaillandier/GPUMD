@@ -877,3 +877,227 @@ void Ensemble::scale_velocity_local(
     velocity_per_atom.data() + 2 * number_of_atoms);
   GPU_CHECK_KERNEL
 }
+
+// ============================================================================
+// RECENTERING FUNCTIONALITY
+// ============================================================================
+
+// Kernel to compute center of mass position for each group
+static __global__ void gpu_find_com_position(
+  const int* g_group_size,
+  const int* g_group_size_sum,
+  const int* g_group_contents,
+  const double* g_mass,
+  const double* g_x,
+  const double* g_y,
+  const double* g_z,
+  double* g_com_x,
+  double* g_com_y,
+  double* g_com_z)
+{
+  int tid = threadIdx.x;
+  int bid = blockIdx.x;
+
+  int group_size = g_group_size[bid];
+  int offset = g_group_size_sum[bid];
+  int number_of_patches = (group_size - 1) / 512 + 1;
+
+  __shared__ double s_mass[512];
+  __shared__ double s_mx[512];
+  __shared__ double s_my[512];
+  __shared__ double s_mz[512];
+
+  s_mass[tid] = 0.0;
+  s_mx[tid] = 0.0;
+  s_my[tid] = 0.0;
+  s_mz[tid] = 0.0;
+
+  for (int patch = 0; patch < number_of_patches; ++patch) {
+    int n = tid + patch * 512;
+    if (n < group_size) {
+      int atom_index = g_group_contents[offset + n];
+      double mass = g_mass[atom_index];
+      double x = g_x[atom_index];
+      double y = g_y[atom_index];
+      double z = g_z[atom_index];
+
+      s_mass[tid] += mass;
+      s_mx[tid] += mass * x;
+      s_my[tid] += mass * y;
+      s_mz[tid] += mass * z;
+    }
+  }
+  __syncthreads();
+
+  for (int stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+    if (tid < stride) {
+      s_mass[tid] += s_mass[tid + stride];
+      s_mx[tid] += s_mx[tid + stride];
+      s_my[tid] += s_my[tid + stride];
+      s_mz[tid] += s_mz[tid + stride];
+    }
+    __syncthreads();
+  }
+
+  if (tid == 0) {
+    double total_mass = s_mass[0];
+    g_com_x[bid] = s_mx[0] / total_mass;
+    g_com_y[bid] = s_my[0] / total_mass;
+    g_com_z[bid] = s_mz[0] / total_mass;
+  }
+}
+
+// Kernel to shift atom positions
+static __global__ void gpu_shift_positions(
+  const int number_of_atoms,
+  const int* g_group_contents,
+  const int group_size,
+  const int group_offset,
+  const double shift_x,
+  const double shift_y,
+  const double shift_z,
+  double* g_x,
+  double* g_y,
+  double* g_z)
+{
+  const int n = blockIdx.x * blockDim.x + threadIdx.x;
+  if (n < group_size) {
+    const int atom_index = g_group_contents[group_offset + n];
+    g_x[atom_index] += shift_x;
+    g_y[atom_index] += shift_y;
+    g_z[atom_index] += shift_z;
+  }
+}
+
+// Setup recentering parameters
+void Ensemble::setup_recenter(
+  int group_id,
+  double x_target, double y_target, double z_target,
+  bool x_flag, bool y_flag, bool z_flag,
+  bool x_init, bool y_init, bool z_init,
+  int shift_group_id)
+{
+  recenter_enabled = true;
+  recenter_group = group_id;
+  recenter_shift_group = (shift_group_id < 0) ? group_id : shift_group_id;
+
+  target_com[0] = x_target;
+  target_com[1] = y_target;
+  target_com[2] = z_target;
+
+  recenter_flag[0] = x_flag;
+  recenter_flag[1] = y_flag;
+  recenter_flag[2] = z_flag;
+
+  use_initial_com[0] = x_init;
+  use_initial_com[1] = y_init;
+  use_initial_com[2] = z_init;
+
+  // Allocate GPU buffers for all groups
+  const int num_groups = (*group)[0].number;
+  com_x.resize(num_groups, Memory_Type::managed);
+  com_y.resize(num_groups, Memory_Type::managed);
+  com_z.resize(num_groups, Memory_Type::managed);
+
+  printf("Recentering enabled:\n");
+  printf("  Group: %d\n", recenter_group);
+  printf("  Target: x=%s y=%s z=%s\n",
+         x_init ? "INIT" : (x_flag ? std::to_string(x_target).c_str() : "NULL"),
+         y_init ? "INIT" : (y_flag ? std::to_string(y_target).c_str() : "NULL"),
+         z_init ? "INIT" : (z_flag ? std::to_string(z_target).c_str() : "NULL"));
+  if (shift_group_id >= 0) {
+    printf("  Shift group: %d\n", shift_group_id);
+  }
+}
+
+// Compute and store initial COM
+void Ensemble::compute_initial_com()
+{
+  if (!recenter_enabled) return;
+
+  const int num_groups = (*group)[0].number;
+  const int N = atom->number_of_atoms;
+
+  // Compute COM for all groups
+  gpu_find_com_position<<<num_groups, 512>>>(
+    (*group)[0].size.data(),
+    (*group)[0].size_sum.data(),
+    (*group)[0].contents.data(),
+    atom->mass.data(),
+    atom->position_per_atom.data(),
+    atom->position_per_atom.data() + N,
+    atom->position_per_atom.data() + 2 * N,
+    com_x.data(),
+    com_y.data(),
+    com_z.data());
+  GPU_CHECK_KERNEL
+
+  // Synchronize to ensure managed memory is accessible on host
+  CHECK(gpuDeviceSynchronize());
+
+  // Store initial COM for the recenter group
+  initial_com[0] = com_x.data()[recenter_group];
+  initial_com[1] = com_y.data()[recenter_group];
+  initial_com[2] = com_z.data()[recenter_group];
+
+  printf("Initial COM: x=%.6f y=%.6f z=%.6f\n",
+         initial_com[0], initial_com[1], initial_com[2]);
+}
+
+// Apply recentering during simulation
+void Ensemble::apply_recenter()
+{
+  if (!recenter_enabled) return;
+
+  const int num_groups = (*group)[0].number;
+  const int N = atom->number_of_atoms;
+
+  // Step 1: Compute current COM for all groups
+  gpu_find_com_position<<<num_groups, 512>>>(
+    (*group)[0].size.data(),
+    (*group)[0].size_sum.data(),
+    (*group)[0].contents.data(),
+    atom->mass.data(),
+    atom->position_per_atom.data(),
+    atom->position_per_atom.data() + N,
+    atom->position_per_atom.data() + 2 * N,
+    com_x.data(),
+    com_y.data(),
+    com_z.data());
+  GPU_CHECK_KERNEL
+
+  // Synchronize to ensure managed memory is accessible on host
+  CHECK(gpuDeviceSynchronize());
+
+  // Step 2: Calculate shift
+  double current_com[3] = {
+    com_x.data()[recenter_group],
+    com_y.data()[recenter_group],
+    com_z.data()[recenter_group]
+  };
+
+  double target[3];
+  for (int d = 0; d < 3; ++d) {
+    target[d] = use_initial_com[d] ? initial_com[d] : target_com[d];
+  }
+
+  double shift[3];
+  for (int d = 0; d < 3; ++d) {
+    shift[d] = recenter_flag[d] ? (target[d] - current_com[d]) : 0.0;
+  }
+
+  // Step 3: Apply shift to the shift group
+  const int shift_group_size = (*group)[0].cpu_size[recenter_shift_group];
+  const int shift_group_offset = (*group)[0].cpu_size_sum[recenter_shift_group];
+
+  gpu_shift_positions<<<(shift_group_size - 1) / 128 + 1, 128>>>(
+    N,
+    (*group)[0].contents.data(),
+    shift_group_size,
+    shift_group_offset,
+    shift[0], shift[1], shift[2],
+    atom->position_per_atom.data(),
+    atom->position_per_atom.data() + N,
+    atom->position_per_atom.data() + 2 * N);
+  GPU_CHECK_KERNEL
+}

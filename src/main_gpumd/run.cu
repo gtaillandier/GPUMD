@@ -570,6 +570,8 @@ void Run::parse_one_keyword(std::vector<std::string>& tokens)
     integrate.parse_fix(param, num_param, group);
   } else if (strcmp(param[0], "move") == 0) {
     integrate.parse_move(param, num_param, group);
+  } else if (strcmp(param[0], "recenter") == 0) {
+    integrate.parse_recenter(param, num_param, group);
   } else if (strcmp(param[0], "electron_stop") == 0) {
     electron_stop.parse(param, num_param, atom.number_of_atoms, number_of_types);
   } else if (strcmp(param[0], "add_random_force") == 0) {

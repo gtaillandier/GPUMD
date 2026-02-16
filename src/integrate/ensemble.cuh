@@ -19,6 +19,7 @@
 #include "model/box.cuh"
 #include "model/group.cuh"
 #include "utilities/gpu_vector.cuh"
+#include <string>
 #include <vector>
 
 #define NOSE_HOOVER_CHAIN_LENGTH 4
@@ -96,6 +97,31 @@ public:
   double mas_nhc2[NOSE_HOOVER_CHAIN_LENGTH];
   double pos_nhc2[NOSE_HOOVER_CHAIN_LENGTH];
   double vel_nhc2[NOSE_HOOVER_CHAIN_LENGTH];
+
+  // Recentering functionality
+  bool recenter_enabled = false;
+  int recenter_group = -1;
+  int recenter_shift_group = -1;
+  double target_com[3] = {0.0, 0.0, 0.0};
+  bool recenter_flag[3] = {true, true, true};
+  bool use_initial_com[3] = {false, false, false};
+  double initial_com[3] = {0.0, 0.0, 0.0};
+
+  // GPU buffers for COM calculation
+  GPU_Vector<double> com_x;
+  GPU_Vector<double> com_y;
+  GPU_Vector<double> com_z;
+
+  // Recentering methods
+  void setup_recenter(
+    int group_id,
+    double x_target, double y_target, double z_target,
+    bool x_flag, bool y_flag, bool z_flag,
+    bool x_init, bool y_init, bool z_init,
+    int shift_group_id = -1);
+
+  void apply_recenter();
+  void compute_initial_com();
 
 protected:
   void velocity_verlet(

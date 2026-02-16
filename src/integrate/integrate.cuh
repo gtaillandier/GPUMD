@@ -67,6 +67,7 @@ public:
   void parse_deform(const char**, int);
   void parse_fix(const char**, int, std::vector<Group>& group);
   void parse_move(const char**, int, std::vector<Group>& group);
+  void parse_recenter(const char**, int, const std::vector<Group>& group);
 
   // these data will be used to initialize ensemble
   int type; // ensemble type in a specific run
@@ -97,4 +98,18 @@ public:
   // save some quantities for ensemble to use.
   int current_step = 0;
   int total_steps = 0;
+
+  // Recenter parameters (stored until ensemble is created)
+  bool recenter_pending = false;
+  int recenter_group_id = -1;
+  int recenter_shift_group_id = -1;
+  double recenter_x_target = 0.0;
+  double recenter_y_target = 0.0;
+  double recenter_z_target = 0.0;
+  bool recenter_x_flag = true;
+  bool recenter_y_flag = true;
+  bool recenter_z_flag = true;
+  bool recenter_x_init = false;
+  bool recenter_y_init = false;
+  bool recenter_z_init = false;
 };

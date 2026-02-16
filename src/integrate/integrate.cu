@@ -208,6 +208,18 @@ void Integrate::initialize(
   ensemble->total_steps = &this->total_steps;
   ensemble->thermo = &thermo;
   ensemble->fixed_group = fixed_group;
+
+  // Apply pending recentering if configured
+  if (recenter_pending) {
+    ensemble->setup_recenter(
+      recenter_group_id,
+      recenter_x_target, recenter_y_target, recenter_z_target,
+      recenter_x_flag, recenter_y_flag, recenter_z_flag,
+      recenter_x_init, recenter_y_init, recenter_z_init,
+      recenter_shift_group_id);
+    ensemble->compute_initial_com();
+    ensemble->apply_recenter();
+  }
 }
 
 void Integrate::finalize()
@@ -217,6 +229,7 @@ void Integrate::finalize()
   deform_x = 0;
   deform_y = 0;
   deform_z = 0;
+  recenter_pending = false;
 }
 
 static __global__ void gpu_copy_position(
@@ -284,6 +297,9 @@ void Integrate::compute1(
   }
 
   ensemble->compute1(time_step, group, box, atom, thermo);
+
+  // Apply recentering after position update
+  ensemble->apply_recenter();
 
   if (atom.unwrapped_position.size() > 0) {
     gpu_update_unwrapped_position<<<(atom.number_of_atoms - 1) / 128 + 1, 128>>>(
@@ -1110,4 +1126,89 @@ void Integrate::parse_deform(const char** param, int num_param)
   if (deform_z) {
     printf("    apply strain in z direction.\n");
   }
+}
+
+void Integrate::parse_recenter(const char** param, int num_param, const std::vector<Group>& group)
+{
+  printf("Parsing recenter command.\n");
+
+  if (num_param < 5) {
+    PRINT_INPUT_ERROR("recenter command needs at least 4 parameters.");
+  }
+
+  // Parse group
+  int group_id;
+  if (!is_valid_int(param[1], &group_id)) {
+    PRINT_INPUT_ERROR("group_id for recenter should be an integer.");
+  }
+  if (group_id < 0 || group_id >= group[0].number) {
+    PRINT_INPUT_ERROR("Invalid group_id for recenter.");
+  }
+
+  // Parse x coordinate
+  double x_target = 0.0;
+  bool x_flag = true, x_init = false;
+  if (strcmp(param[2], "NULL") == 0) {
+    x_flag = false;
+  } else if (strcmp(param[2], "INIT") == 0) {
+    x_init = true;
+  } else {
+    if (!is_valid_real(param[2], &x_target)) {
+      PRINT_INPUT_ERROR("x_target for recenter should be a number or NULL/INIT.");
+    }
+  }
+
+  // Parse y coordinate
+  double y_target = 0.0;
+  bool y_flag = true, y_init = false;
+  if (strcmp(param[3], "NULL") == 0) {
+    y_flag = false;
+  } else if (strcmp(param[3], "INIT") == 0) {
+    y_init = true;
+  } else {
+    if (!is_valid_real(param[3], &y_target)) {
+      PRINT_INPUT_ERROR("y_target for recenter should be a number or NULL/INIT.");
+    }
+  }
+
+  // Parse z coordinate
+  double z_target = 0.0;
+  bool z_flag = true, z_init = false;
+  if (strcmp(param[4], "NULL") == 0) {
+    z_flag = false;
+  } else if (strcmp(param[4], "INIT") == 0) {
+    z_init = true;
+  } else {
+    if (!is_valid_real(param[4], &z_target)) {
+      PRINT_INPUT_ERROR("z_target for recenter should be a number or NULL/INIT.");
+    }
+  }
+
+  // Parse optional shift group
+  int shift_group_id = -1;
+  for (int k = 5; k < num_param; ++k) {
+    if (strcmp(param[k], "shift") == 0) {
+      if (k + 1 >= num_param) {
+        PRINT_INPUT_ERROR("shift keyword requires group_id.");
+      }
+      if (!is_valid_int(param[k + 1], &shift_group_id)) {
+        PRINT_INPUT_ERROR("shift_group_id for recenter should be an integer.");
+      }
+      break;
+    }
+  }
+
+  // Store parameters for deferred application in initialize()
+  recenter_pending = true;
+  recenter_group_id = group_id;
+  recenter_shift_group_id = shift_group_id;
+  recenter_x_target = x_target;
+  recenter_y_target = y_target;
+  recenter_z_target = z_target;
+  recenter_x_flag = x_flag;
+  recenter_y_flag = y_flag;
+  recenter_z_flag = z_flag;
+  recenter_x_init = x_init;
+  recenter_y_init = y_init;
+  recenter_z_init = z_init;
 }
