@@ -1194,6 +1194,9 @@ void Integrate::parse_recenter(const char** param, int num_param, const std::vec
       if (!is_valid_int(param[k + 1], &shift_group_id)) {
         PRINT_INPUT_ERROR("shift_group_id for recenter should be an integer.");
       }
+      if (shift_group_id < 0 || shift_group_id >= group[0].number) {
+        PRINT_INPUT_ERROR("Invalid shift_group_id for recenter.");
+      }
       break;
     }
   }

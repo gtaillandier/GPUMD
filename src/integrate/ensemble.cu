@@ -993,20 +993,39 @@ void Ensemble::setup_recenter(
   use_initial_com[1] = y_init;
   use_initial_com[2] = z_init;
 
-  // Allocate GPU buffers for all groups
-  const int num_groups = (*group)[0].number;
-  com_x.resize(num_groups, Memory_Type::managed);
-  com_y.resize(num_groups, Memory_Type::managed);
-  com_z.resize(num_groups, Memory_Type::managed);
+  // Allocate GPU buffers for COM result (only need 1 element for single-group kernel)
+  com_x.resize(1, Memory_Type::managed);
+  com_y.resize(1, Memory_Type::managed);
+  com_z.resize(1, Memory_Type::managed);
+
+  // Ensure unwrapped positions are available for correct PBC COM computation
+  const int N = atom->number_of_atoms;
+  if (atom->unwrapped_position.size() < static_cast<size_t>(N * 3)) {
+    atom->unwrapped_position.resize(N * 3);
+    // Initialize unwrapped positions from current wrapped positions
+    CHECK(gpuMemcpy(
+      atom->unwrapped_position.data(),
+      atom->position_per_atom.data(),
+      sizeof(double) * N * 3,
+      gpuMemcpyDeviceToDevice));
+  }
+  if (atom->position_temp.size() < static_cast<size_t>(N * 3)) {
+    atom->position_temp.resize(N * 3);
+  }
+
+  // Store target strings before printf to avoid dangling pointer UB
+  std::string x_str = x_init ? "INIT" : (x_flag ? std::to_string(x_target) : "NULL");
+  std::string y_str = y_init ? "INIT" : (y_flag ? std::to_string(y_target) : "NULL");
+  std::string z_str = z_init ? "INIT" : (z_flag ? std::to_string(z_target) : "NULL");
 
   printf("Recentering enabled:\n");
   printf("  Group: %d\n", recenter_group);
-  printf("  Target: x=%s y=%s z=%s\n",
-         x_init ? "INIT" : (x_flag ? std::to_string(x_target).c_str() : "NULL"),
-         y_init ? "INIT" : (y_flag ? std::to_string(y_target).c_str() : "NULL"),
-         z_init ? "INIT" : (z_flag ? std::to_string(z_target).c_str() : "NULL"));
+  printf("  Target: x=%s y=%s z=%s\n", x_str.c_str(), y_str.c_str(), z_str.c_str());
   if (shift_group_id >= 0) {
     printf("  Shift group: %d\n", shift_group_id);
+  }
+  if (recenter_shift_group != recenter_group) {
+    printf("  WARNING: shift_group != recenter_group — momentum is NOT conserved!\n");
   }
 }
 
@@ -1015,18 +1034,17 @@ void Ensemble::compute_initial_com()
 {
   if (!recenter_enabled) return;
 
-  const int num_groups = (*group)[0].number;
   const int N = atom->number_of_atoms;
 
-  // Compute COM for all groups
-  gpu_find_com_position<<<num_groups, 512>>>(
-    (*group)[0].size.data(),
-    (*group)[0].size_sum.data(),
+  // Compute COM for recenter group only, using unwrapped positions for PBC correctness
+  gpu_find_com_position<<<1, 512>>>(
+    (*group)[0].size.data() + recenter_group,
+    (*group)[0].size_sum.data() + recenter_group,
     (*group)[0].contents.data(),
     atom->mass.data(),
-    atom->position_per_atom.data(),
-    atom->position_per_atom.data() + N,
-    atom->position_per_atom.data() + 2 * N,
+    atom->unwrapped_position.data(),
+    atom->unwrapped_position.data() + N,
+    atom->unwrapped_position.data() + 2 * N,
     com_x.data(),
     com_y.data(),
     com_z.data());
@@ -1035,10 +1053,10 @@ void Ensemble::compute_initial_com()
   // Synchronize to ensure managed memory is accessible on host
   CHECK(gpuDeviceSynchronize());
 
-  // Store initial COM for the recenter group
-  initial_com[0] = com_x.data()[recenter_group];
-  initial_com[1] = com_y.data()[recenter_group];
-  initial_com[2] = com_z.data()[recenter_group];
+  // Store initial COM (result is at index 0 since we launched 1 block)
+  initial_com[0] = com_x.data()[0];
+  initial_com[1] = com_y.data()[0];
+  initial_com[2] = com_z.data()[0];
 
   printf("Initial COM: x=%.6f y=%.6f z=%.6f\n",
          initial_com[0], initial_com[1], initial_com[2]);
@@ -1049,18 +1067,17 @@ void Ensemble::apply_recenter()
 {
   if (!recenter_enabled) return;
 
-  const int num_groups = (*group)[0].number;
   const int N = atom->number_of_atoms;
 
-  // Step 1: Compute current COM for all groups
-  gpu_find_com_position<<<num_groups, 512>>>(
-    (*group)[0].size.data(),
-    (*group)[0].size_sum.data(),
+  // Step 1: Compute current COM for recenter group only, using unwrapped positions
+  gpu_find_com_position<<<1, 512>>>(
+    (*group)[0].size.data() + recenter_group,
+    (*group)[0].size_sum.data() + recenter_group,
     (*group)[0].contents.data(),
     atom->mass.data(),
-    atom->position_per_atom.data(),
-    atom->position_per_atom.data() + N,
-    atom->position_per_atom.data() + 2 * N,
+    atom->unwrapped_position.data(),
+    atom->unwrapped_position.data() + N,
+    atom->unwrapped_position.data() + 2 * N,
     com_x.data(),
     com_y.data(),
     com_z.data());
@@ -1069,11 +1086,11 @@ void Ensemble::apply_recenter()
   // Synchronize to ensure managed memory is accessible on host
   CHECK(gpuDeviceSynchronize());
 
-  // Step 2: Calculate shift
+  // Step 2: Calculate shift (result is at index 0 since we launched 1 block)
   double current_com[3] = {
-    com_x.data()[recenter_group],
-    com_y.data()[recenter_group],
-    com_z.data()[recenter_group]
+    com_x.data()[0],
+    com_y.data()[0],
+    com_z.data()[0]
   };
 
   double target[3];
@@ -1086,7 +1103,7 @@ void Ensemble::apply_recenter()
     shift[d] = recenter_flag[d] ? (target[d] - current_com[d]) : 0.0;
   }
 
-  // Step 3: Apply shift to the shift group
+  // Step 3: Apply shift to wrapped positions
   const int shift_group_size = (*group)[0].cpu_size[recenter_shift_group];
   const int shift_group_offset = (*group)[0].cpu_size_sum[recenter_shift_group];
 
@@ -1099,5 +1116,17 @@ void Ensemble::apply_recenter()
     atom->position_per_atom.data(),
     atom->position_per_atom.data() + N,
     atom->position_per_atom.data() + 2 * N);
+  GPU_CHECK_KERNEL
+
+  // Step 4: Also shift unwrapped positions to stay consistent
+  gpu_shift_positions<<<(shift_group_size - 1) / 128 + 1, 128>>>(
+    N,
+    (*group)[0].contents.data(),
+    shift_group_size,
+    shift_group_offset,
+    shift[0], shift[1], shift[2],
+    atom->unwrapped_position.data(),
+    atom->unwrapped_position.data() + N,
+    atom->unwrapped_position.data() + 2 * N);
   GPU_CHECK_KERNEL
 }
